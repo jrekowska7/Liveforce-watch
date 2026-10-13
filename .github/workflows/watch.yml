@@ -1,17 +1,33 @@
+# No-server deployment: copy this to .github/workflows/watch.yml in a PUBLIC repo
+# (public = unlimited free Actions minutes; private only gets 2,000 min/month,
+# which a long-running watcher would exhaust in a few days).
+#
+# Safe to make public: credentials live in encrypted repository secrets, the logs
+# print counts only - never job titles - and state.json holds nothing but job ids.
+#
+# Each run polls every 60s for just under 5 hours, then exits so the next run
+# takes over. Set the three secrets in Settings > Secrets and variables > Actions:
+#   LF_EMAIL, LF_PASSWORD, NTFY_TOPIC
 name: liveforce-watch
 
 on:
   schedule:
     - cron: "0 */5 * * *"
   workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Send one test push and stop (leaves the running watcher alone)"
+        type: boolean
+        default: false
 
 # Never run two watchers at once: a second one would not know what the first has
 # already notified about. The newest run wins - without this, a manual re-run would
 # sit queued behind the 5-hour run already in progress. The running job normally
 # exits on its own (--max-runtime) before the next schedule fires, so cancelling
 # here is the exception, not the rule.
+# A test push gets its own group so it does not cancel the live watcher.
 concurrency:
-  group: liveforce-watch
+  group: liveforce-watch-${{ inputs.test_notification }}
   cancel-in-progress: true
 
 jobs:
@@ -25,7 +41,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Proves the NTFY_TOPIC secret reaches your phone. GitHub masks the value in
+      # logs, so only its length is printed.
+      - name: Send a test push
+        if: inputs.test_notification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          topic = os.environ.get("NTFY_TOPIC", "")
+          if not topic.strip():
+              sys.exit("The NTFY_TOPIC secret is missing or empty - add it in Settings > Secrets and variables > Actions")
+          print(f"NTFY_TOPIC is set ({len(topic)} characters)")
+          PY
+          python watch.py --test-notification
+
       - name: Cache the Chromium download
+        if: ${{ !inputs.test_notification }}
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -34,6 +67,7 @@ jobs:
       # Turns "my edit did not land on the default branch" into a 5-second, obvious
       # failure instead of a confusing 60-second timeout later on.
       - name: Check the committed watcher is current
+        if: ${{ !inputs.test_notification }}
         run: |
           python - <<'PY'
           import pathlib, sys
@@ -47,6 +81,7 @@ jobs:
           PY
 
       - name: Install Playwright
+        if: ${{ !inputs.test_notification }}
         run: |
           pip install playwright
           playwright install --with-deps chromium
@@ -54,6 +89,7 @@ jobs:
       # Carries the "already seen" list between runs. If this ever misses, the
       # next run re-baselines silently rather than announcing the whole board.
       - name: Restore seen-shift list
+        if: ${{ !inputs.test_notification }}
         uses: actions/cache@v4
         with:
           path: state.json
@@ -61,6 +97,7 @@ jobs:
           restore-keys: lf-state-
 
       - name: Watch the job board
+        if: ${{ !inputs.test_notification }}
         env:
           LF_EMAIL: ${{ secrets.LF_EMAIL }}
           LF_PASSWORD: ${{ secrets.LF_PASSWORD }}
