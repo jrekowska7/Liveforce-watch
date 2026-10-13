@@ -51,6 +51,42 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2), "utf8")
 
 
+LOGIN_ERRORS = (
+    "Incorrect email or password",
+    "Your account has been locked",
+    "too many login attempts",
+)
+
+
+def _settle_after_login(page, captured: list, timeout: float) -> None:
+    """Wait for the job board, translating the known dead ends into clear errors."""
+    deadline = time.monotonic() + timeout
+    nudged = False
+    while time.monotonic() < deadline:
+        if captured:
+            return
+        url = page.url
+        if "/mfa-verify" in url:
+            raise RuntimeError(
+                "account has two-factor auth enabled - a headless login cannot pass it; "
+                "run once with LF_HEADFUL=1 to complete it by hand"
+            )
+        # Deliberately not logged: page text can contain job details.
+        body = page.inner_text("body")
+        for message in LOGIN_ERRORS:
+            if message in body:
+                raise RuntimeError(f"Liveforce rejected the login: {message!r} - check LF_EMAIL / LF_PASSWORD")
+        if "/job-board" in url:
+            return
+        if not nudged and "/login" not in url:
+            # Crew with several agencies land on the account chooser instead.
+            log(f"landed on {url.replace(APP_URL, '')}, going to the job board")
+            page.goto(JOB_BOARD_URL, wait_until="domcontentloaded")
+            nudged = True
+        page.wait_for_timeout(1_000)
+    raise RuntimeError(f"login did not reach the job board within {timeout:.0f}s (stuck on {page.url})")
+
+
 def capture_requests(email: str, password: str) -> list[dict]:
     """Log in with a headless browser and capture the live JobsAvailable calls."""
     from playwright.sync_api import sync_playwright
@@ -61,6 +97,7 @@ def capture_requests(email: str, password: str) -> list[dict]:
         headful = os.environ.get("LF_HEADFUL") == "1"
         browser = p.chromium.launch(headless=not headful, slow_mo=500 if headful else 0)
         page = browser.new_page()
+        page.set_default_timeout(60_000)
 
         def on_request(req):
             if req.method != "POST" or "gql" not in req.url:
@@ -77,10 +114,12 @@ def capture_requests(email: str, password: str) -> list[dict]:
                 captured.append({"url": req.url, "headers": headers, "body": body})
 
         page.on("request", on_request)
-        page.goto(f"{APP_URL}/login", wait_until="networkidle")
+        # Never wait for "networkidle" here: the app holds websockets open for chat
+        # and GraphQL subscriptions, so the network never goes quiet.
+        page.goto(f"{APP_URL}/login", wait_until="domcontentloaded")
         # The login form arrives with a lazy-loaded chunk, so wait for it rather
         # than racing it.
-        page.wait_for_selector("#email", timeout=60_000)
+        page.wait_for_selector("#email")
         page.fill("#email", email)
         page.fill("#password", password)
         try:
@@ -88,16 +127,19 @@ def capture_requests(email: str, password: str) -> list[dict]:
         except Exception:
             pass
         page.get_by_role("button", name="Login").click()
-        # A generous timeout so LF_HEADFUL=1 leaves room to finish 2FA by hand.
-        page.wait_for_url("**/job-board**", timeout=180_000 if headful else 60_000)
-        page.wait_for_load_state("networkidle")
-        if not captured:
-            page.reload(wait_until="networkidle")
-        page.wait_for_timeout(3_000)
+        _settle_after_login(page, captured, timeout=180 if headful else 90)
+
+        # The board may render from cache without re-querying; a reload forces it.
+        for _ in range(2):
+            if captured:
+                break
+            page.goto(JOB_BOARD_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(8_000)
+        ended_on = page.url
         browser.close()
 
     if not captured:
-        raise RuntimeError("logged in but captured no JobsAvailable request")
+        raise RuntimeError(f"logged in but captured no JobsAvailable request (ended on {ended_on})")
     log(f"captured {len(captured)} JobsAvailable request(s)")
     return captured
 
@@ -239,11 +281,17 @@ def main() -> int:
 
     state = load_state()
     deadline = time.monotonic() + args.max_runtime if args.max_runtime else None
+    failures = 0
     while True:
         try:
             state = check_once(state, email, password, quiet_first_run=not args.notify_first_run)
+            failures = 0
         except Exception as exc:  # keep a resident watcher alive across transient failures
             log(f"check failed: {type(exc).__name__}: {exc}")
+            failures += 1
+            # Nobody reads logs on a headless host, so say it out loud once.
+            if failures == 3:
+                notify("Liveforce watcher is stuck", f"{type(exc).__name__}: {exc}"[:400])
             if not args.loop:
                 return 1
         if not args.loop:
