@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import sys
 import time
@@ -185,11 +186,31 @@ def extract_shifts(payload: dict) -> dict[str, str]:
     return shifts
 
 
+TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def ntfy_topic(raw: str) -> str:
+    """Normalise NTFY_TOPIC, tolerating a pasted URL and rejecting junk early.
+
+    A bad topic otherwise surfaces as a raw urllib traceback from inside notify(),
+    which says nothing useful about the actual mistake.
+    """
+    topic = raw.strip().strip("/")
+    if "/" in topic:  # someone pasted https://ntfy.sh/my-topic instead of my-topic
+        topic = topic.rsplit("/", 1)[-1]
+    if not TOPIC_PATTERN.match(topic):
+        raise RuntimeError(
+            "NTFY_TOPIC must be 1-64 characters, letters/digits/'-'/'_' only "
+            "(no spaces, no '.', no URL) - it is the topic name, not a link"
+        )
+    return topic
+
+
 def notify(title: str, body: str) -> None:
     topic = os.environ.get("NTFY_TOPIC")
     pushover_token = os.environ.get("PUSHOVER_TOKEN")
     if topic:
-        url = f"{os.environ.get('NTFY_SERVER', 'https://ntfy.sh')}/{topic}"
+        url = f"{os.environ.get('NTFY_SERVER', 'https://ntfy.sh')}/{ntfy_topic(topic)}"
         req = urllib.request.Request(
             url,
             data=body.encode("utf8"),
@@ -200,7 +221,11 @@ def notify(title: str, body: str) -> None:
                 "Click": JOB_BOARD_URL,
             },
         )
-        urllib.request.urlopen(req, timeout=20).read()
+        try:
+            urllib.request.urlopen(req, timeout=20).read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:200].decode("utf8", "replace")
+            raise RuntimeError(f"ntfy refused the push (HTTP {exc.code}): {detail}") from None
     elif pushover_token:
         data = urllib.parse.urlencode(
             {
