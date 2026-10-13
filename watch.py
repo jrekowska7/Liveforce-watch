@@ -62,6 +62,14 @@ LOGIN_ERRORS = (
 )
 
 
+class RecaptchaBlocked(RuntimeError):
+    """Liveforce's login endpoint refused the attempt on a reCAPTCHA score.
+
+    Nothing about the credentials is wrong, and the app shows no error at all, so
+    without this the only symptom is a silent 90s stall. Worth retrying soon.
+    """
+
+
 class LoginRejected(RuntimeError):
     """Liveforce refused the credentials.
 
@@ -70,13 +78,15 @@ class LoginRejected(RuntimeError):
     """
 
 
-def _settle_after_login(page, captured: list, timeout: float) -> None:
+def _settle_after_login(page, captured: list, timeout: float, blocked: list | None = None) -> None:
     """Wait for the job board, translating the known dead ends into clear errors."""
     deadline = time.monotonic() + timeout
     nudged = False
     while time.monotonic() < deadline:
         if captured:
             return
+        if blocked:
+            raise RecaptchaBlocked(f"login blocked before the password was checked: {blocked[0]}")
         url = page.url
         if "/mfa-verify" in url:
             raise RuntimeError(
@@ -123,17 +133,45 @@ def _agencies(page) -> list[tuple[int, str]]:
     return found
 
 
-def capture_requests(email: str, password: str) -> list[dict]:
-    """Log in with a headless browser and capture the live JobsAvailable calls."""
+def _capture_once(email: str, password: str) -> list[dict]:
+    """One login attempt; capture the live JobsAvailable calls for every agency."""
     from playwright.sync_api import sync_playwright
 
     captured: list[dict] = []
 
     with sync_playwright() as p:
         headful = os.environ.get("LF_HEADFUL") == "1"
-        browser = p.chromium.launch(headless=not headful, slow_mo=500 if headful else 0)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=not headful,
+            slow_mo=500 if headful else 0,
+            # Chromium advertises itself as automated, which reCAPTCHA scores down.
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            viewport={"width": 412, "height": 915},
+            locale="en-AU",
+            timezone_id="Australia/Sydney",
+            user_agent=(
+                "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+            ),
+        )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page = context.new_page()
         page.set_default_timeout(60_000)
+
+        blocked: list[str] = []
+
+        def on_response(resp):
+            if "crew-login" not in resp.url:
+                return
+            if resp.status == 403:
+                try:
+                    blocked.append(resp.text()[:200])
+                except Exception:
+                    blocked.append(f"HTTP {resp.status}")
+
+        page.on("response", on_response)
 
         def on_request(req):
             if req.method != "POST" or "gql" not in req.url:
@@ -163,7 +201,7 @@ def capture_requests(email: str, password: str) -> list[dict]:
         except Exception:
             pass
         page.get_by_role("button", name="Login").click()
-        _settle_after_login(page, captured, timeout=180 if headful else 90)
+        _settle_after_login(page, captured, timeout=180 if headful else 90, blocked=blocked)
 
         agencies = _agencies(page)
         log(f"connected to {len(agencies)} agency board(s): " + ", ".join(n for _, n in agencies))
@@ -192,6 +230,25 @@ def capture_requests(email: str, password: str) -> list[dict]:
         raise RuntimeError(f"logged in but captured no JobsAvailable request (ended on {ended_on})")
     log(f"captured {len(unique)} board(s): " + ", ".join(u["agency"] for u in unique))
     return unique
+
+
+def capture_requests(email: str, password: str, attempts: int = 4) -> list[dict]:
+    """Log in, retrying a reCAPTCHA refusal.
+
+    The score varies between attempts, so a refusal is worth retrying straight
+    away rather than waiting out the whole poll interval. Credential rejections
+    are not retried - they would only burn attempts toward an account lock.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return _capture_once(email, password)
+        except RecaptchaBlocked as exc:
+            if attempt == attempts:
+                raise
+            delay = 15 * attempt
+            log(f"login attempt {attempt}/{attempts} blocked by reCAPTCHA, retrying in {delay}s")
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def post(req_spec: dict) -> dict:
