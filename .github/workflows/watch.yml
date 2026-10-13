@@ -1,13 +1,3 @@
-# No-server deployment: copy this to .github/workflows/watch.yml in a PUBLIC repo
-# (public = unlimited free Actions minutes; private only gets 2,000 min/month,
-# which a long-running watcher would exhaust in a few days).
-#
-# Safe to make public: credentials live in encrypted repository secrets, the logs
-# print counts only - never job titles - and state.json holds nothing but job ids.
-#
-# Each run polls every 60s for just under 5 hours, then exits so the next run
-# takes over. Set the three secrets in Settings > Secrets and variables > Actions:
-#   LF_EMAIL, LF_PASSWORD, NTFY_TOPIC
 name: liveforce-watch
 
 on:
@@ -16,10 +6,13 @@ on:
   workflow_dispatch:
 
 # Never run two watchers at once: a second one would not know what the first has
-# already notified about. A queued run starts as soon as the current one exits.
+# already notified about. The newest run wins - without this, a manual re-run would
+# sit queued behind the 5-hour run already in progress. The running job normally
+# exits on its own (--max-runtime) before the next schedule fires, so cancelling
+# here is the exception, not the rule.
 concurrency:
   group: liveforce-watch
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   watch:
@@ -37,6 +30,21 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium
+
+      # Turns "my edit did not land on the default branch" into a 5-second, obvious
+      # failure instead of a confusing 60-second timeout later on.
+      - name: Check the committed watcher is current
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          src = pathlib.Path("watch.py").read_text(encoding="utf8")
+          if "wait_for_url" in src or "_settle_after_login" not in src:
+              sys.exit(
+                  "This is the OLD watch.py. The edit did not reach the branch this "
+                  "workflow runs on - re-commit watch.py to the default branch."
+              )
+          print("watch.py is the current version")
+          PY
 
       - name: Install Playwright
         run: |
