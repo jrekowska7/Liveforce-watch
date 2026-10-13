@@ -11,7 +11,9 @@ Liveforce's side are picked up on the next login instead of breaking the poller.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
+import math
 import re
 import os
 import sys
@@ -19,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zoneinfo
 from pathlib import Path
 
 APP_URL = "https://app.liveforce.co"
@@ -59,6 +62,14 @@ LOGIN_ERRORS = (
 )
 
 
+class LoginRejected(RuntimeError):
+    """Liveforce refused the credentials.
+
+    Retrying cannot fix this and Liveforce locks accounts after repeated failures,
+    so a resident watcher must stop rather than hammer the login form.
+    """
+
+
 def _settle_after_login(page, captured: list, timeout: float) -> None:
     """Wait for the job board, translating the known dead ends into clear errors."""
     deadline = time.monotonic() + timeout
@@ -76,7 +87,7 @@ def _settle_after_login(page, captured: list, timeout: float) -> None:
         body = page.inner_text("body")
         for message in LOGIN_ERRORS:
             if message in body:
-                raise RuntimeError(f"Liveforce rejected the login: {message!r} - check LF_EMAIL / LF_PASSWORD")
+                raise LoginRejected(f"Liveforce rejected the login: {message!r} - check LF_EMAIL / LF_PASSWORD")
         if "/job-board" in url:
             return
         if not nudged and "/login" not in url:
@@ -85,7 +96,31 @@ def _settle_after_login(page, captured: list, timeout: float) -> None:
             page.goto(JOB_BOARD_URL, wait_until="domcontentloaded")
             nudged = True
         page.wait_for_timeout(1_000)
-    raise RuntimeError(f"login did not reach the job board within {timeout:.0f}s (stuck on {page.url})")
+    # Without the page's own words a stall here is undiagnosable from a log alone.
+    # Only the login screen is quoted, which carries no job details.
+    said = ""
+    if "/login" in page.url:
+        first = next((l.strip() for l in page.inner_text("body").splitlines() if l.strip()), "")
+        said = f" - the login page says {first!r}" if first else ""
+    raise RuntimeError(f"login did not reach the job board within {timeout:.0f}s (stuck on {page.url}){said}")
+
+
+def _agencies(page) -> list[tuple[int, str]]:
+    """Every agency the crew is connected to, as (id, name).
+
+    Read off the /accounts page logos, whose URL carries the id
+    (.../logos/151/thumb-x.png) and whose title carries the name. An agency with
+    an incomplete profile still has a readable job board, so it is included.
+    """
+    page.goto(f"{APP_URL}/accounts", wait_until="domcontentloaded")
+    page.wait_for_selector("img[src*='/logos/']")
+    found: list[tuple[int, str]] = []
+    for img in page.locator("img[src*='/logos/']").all():
+        src = img.get_attribute("src") or ""
+        ident = src.partition("/logos/")[2].partition("/")[0]
+        if ident.isdigit() and not any(i == int(ident) for i, _ in found):
+            found.append((int(ident), (img.get_attribute("title") or f"agency {ident}").strip()))
+    return found
 
 
 def capture_requests(email: str, password: str) -> list[dict]:
@@ -130,19 +165,33 @@ def capture_requests(email: str, password: str) -> list[dict]:
         page.get_by_role("button", name="Login").click()
         _settle_after_login(page, captured, timeout=180 if headful else 90)
 
-        # The board may render from cache without re-querying; a reload forces it.
-        for _ in range(2):
-            if captured:
-                break
-            page.goto(JOB_BOARD_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(8_000)
+        agencies = _agencies(page)
+        log(f"connected to {len(agencies)} agency board(s): " + ", ".join(n for _, n in agencies))
+        for company_id, name in agencies:
+            before = len(captured)
+            # ?agencyId= is how the app's own Switch button loads another board.
+            page.goto(f"{JOB_BOARD_URL}?agencyId={company_id}", wait_until="domcontentloaded")
+            for _ in range(3):
+                page.wait_for_timeout(5_000)
+                if len(captured) > before:
+                    break
+            for spec in captured[before:]:
+                spec["company_id"] = company_id
+                spec["agency"] = name
+            if len(captured) == before:
+                log(f"warning: no request captured for {name} - its shifts will not be watched")
         ended_on = page.url
         browser.close()
 
-    if not captured:
+    # The board re-queries on load, so the same agency can appear more than once.
+    unique: list[dict] = []
+    for spec in captured:
+        if spec.get("company_id") and not any(u["company_id"] == spec["company_id"] for u in unique):
+            unique.append(spec)
+    if not unique:
         raise RuntimeError(f"logged in but captured no JobsAvailable request (ended on {ended_on})")
-    log(f"captured {len(captured)} JobsAvailable request(s)")
-    return captured
+    log(f"captured {len(unique)} board(s): " + ", ".join(u["agency"] for u in unique))
+    return unique
 
 
 def post(req_spec: dict) -> dict:
@@ -156,33 +205,87 @@ def post(req_spec: dict) -> dict:
         return json.loads(resp.read())
 
 
+SYDNEY = (-33.8688, 151.2093)
+ORIGIN = (float(os.environ.get("LF_LAT", SYDNEY[0])), float(os.environ.get("LF_LON", SYDNEY[1])))
+RADIUS_KM = float(os.environ.get("LF_RADIUS_KM", 100))
+
+
+def _km_from_origin(lat, lon) -> float | None:
+    """Great-circle distance from ORIGIN, or None when the job has no location."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    if not lat and not lon:
+        return None
+    rlat1, rlat2 = math.radians(ORIGIN[0]), math.radians(lat)
+    dlat = rlat2 - rlat1
+    dlon = math.radians(lon - ORIGIN[1])
+    h = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
+    return 2 * 6371.0088 * math.asin(math.sqrt(h))
+
+
+def _deref(value, table: list):
+    """Resolve Liveforce's "$12" string-table references (the JobCompressed format)."""
+    if isinstance(value, str) and value.startswith("$") and value[1:].isdigit():
+        index = int(value[1:])
+        return table[index] if index < len(table) else ""
+    return value
+
+
+def _when(start_iso: str, timezone: str) -> str:
+    if not start_iso:
+        return "date unknown"
+    try:
+        moment = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return str(start_iso)
+    try:
+        moment = moment.astimezone(zoneinfo.ZoneInfo(timezone or "Australia/Sydney"))
+        return moment.strftime("%a %d %b %H:%M")
+    except Exception:
+        # No tz database on this host; say so rather than imply local time.
+        return moment.strftime("%a %d %b %H:%M UTC")
+
+
 def extract_shifts(payload: dict) -> dict[str, str]:
-    """Map a stable shift key -> human label.
+    """Map role id -> human label, keeping only roles within RADIUS_KM of ORIGIN.
 
-    Liveforce minifies field names (j = jobs, r = roles, i = id), so instead of
-    trusting those letters this walks the response for objects carrying an id and
-    builds the label from their own string fields.
+    A role is the thing you actually apply for, so it -- not the job -- is the unit
+    of notification. Jobs carry the client, venue and coordinates; roles carry the
+    name and start time, and link back by job id.
     """
+    board = (payload.get("data") or {}).get("jobsAvailable")
+    if not isinstance(board, dict) or "j" not in board or "r" not in board:
+        # Returning {} here would look exactly like "no shifts" forever.
+        raise RuntimeError(f"unexpected JobsAvailable response shape: {str(payload)[:200]}")
+
+    table = board.get("v") or []
+    jobs = {}
+    for job in board["j"]:
+        jobs[job.get("i")] = {
+            "client": str(_deref(job.get("t"), table) or "").strip() or "unknown client",
+            "venue": str(_deref(job.get("l"), table) or "").strip(),
+            "timezone": str(_deref(job.get("n"), table) or "").strip(),
+            "km": _km_from_origin(job.get("x"), job.get("y")),
+        }
+
     shifts: dict[str, str] = {}
-
-    def walk(node, parent_key=""):
-        if isinstance(node, dict):
-            ident = node.get("i") or node.get("id")
-            if ident is not None and parent_key in ("j", "r", "jobs", "roles"):
-                texts = [
-                    v.strip()
-                    for k, v in sorted(node.items())
-                    if isinstance(v, str) and k not in ("i", "id") and v.strip() and not v.strip().isdigit()
-                ]
-                label = " | ".join(texts[:6]) or f"id {ident}"
-                shifts[f"{parent_key}:{ident}"] = label
-            for k, v in node.items():
-                walk(v, k)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item, parent_key)
-
-    walk(payload.get("data") or {})
+    for role in board["r"]:
+        job = jobs.get(role.get("j"))
+        if job is None:
+            continue
+        if job["km"] is not None and job["km"] > RADIUS_KM:
+            continue
+        where = job["venue"] or "location unknown"
+        if job["km"] is None:
+            where += " (no coordinates)"
+        else:
+            where += f" ({job['km']:.0f}km)"
+        name = str(_deref(role.get("n"), table) or "").strip() or "role"
+        shifts[f"r:{role.get('i')}"] = " | ".join(
+            (job["client"], name, _when(role.get("s"), job["timezone"]), where)
+        )
     return shifts
 
 
@@ -198,6 +301,13 @@ def ntfy_topic(raw: str) -> str:
     topic = raw.strip().strip("/")
     if "/" in topic:  # someone pasted https://ntfy.sh/my-topic instead of my-topic
         topic = topic.rsplit("/", 1)[-1]
+    if "change-me" in topic.lower():
+        # ntfy accepts a push to any topic, so a leftover placeholder delivers
+        # nowhere and still reports success. Refuse it instead.
+        raise RuntimeError(
+            f"NTFY_TOPIC is still the placeholder {topic!r} - set it to the topic "
+            "your phone is subscribed to in the ntfy app"
+        )
     if not TOPIC_PATTERN.match(topic):
         raise RuntimeError(
             "NTFY_TOPIC must be 1-64 characters, letters/digits/'-'/'_' only "
@@ -249,18 +359,30 @@ def check_once(state: dict, email: str, password: str, quiet_first_run: bool) ->
         state["requests"] = capture_requests(email, password)
         save_state(state)
 
-    shifts: dict[str, str] = {}
-    try:
+    def poll() -> dict[str, str]:
+        # Keys carry the agency: two agencies can issue the same job id, and an
+        # unprefixed key would let the second one hide behind the first.
+        out: dict[str, str] = {}
         for spec in state["requests"]:
-            shifts.update(extract_shifts(post(spec)))
+            agency = spec.get("agency") or str(spec.get("company_id", ""))
+            for key, label in extract_shifts(post(spec)).items():
+                out[f"{agency}/{key}"] = f"{agency}: {label}" if agency else label
+        return out
+
+    try:
+        shifts = poll()
     except urllib.error.HTTPError as exc:
         if exc.code not in (401, 403):
             raise
         log(f"token rejected ({exc.code}), logging in again")
         state["requests"] = capture_requests(email, password)
         save_state(state)
-        for spec in state["requests"]:
-            shifts.update(extract_shifts(post(spec)))
+        shifts = poll()
+
+    if any("/" not in key for key in state["seen"]):
+        log("state predates per-agency keys, re-baselining without notifying")
+        state["seen"] = []
+        quiet_first_run = True
 
     seen = set(state["seen"])
     new = [k for k in shifts if k not in seen]
@@ -303,6 +425,10 @@ def main() -> int:
     if not email or not password:
         print("set LF_EMAIL and LF_PASSWORD", file=sys.stderr)
         return 2
+    if "example.com" in email:
+        # Otherwise this only shows up as "Incorrect email or password".
+        print(f"LF_EMAIL is still the placeholder {email!r}", file=sys.stderr)
+        return 2
 
     state = load_state()
     deadline = time.monotonic() + args.max_runtime if args.max_runtime else None
@@ -311,6 +437,10 @@ def main() -> int:
         try:
             state = check_once(state, email, password, quiet_first_run=not args.notify_first_run)
             failures = 0
+        except LoginRejected as exc:
+            log(f"stopping: {exc}")
+            notify("Liveforce watcher stopped", str(exc)[:400])
+            return 2
         except Exception as exc:  # keep a resident watcher alive across transient failures
             log(f"check failed: {type(exc).__name__}: {exc}")
             failures += 1
