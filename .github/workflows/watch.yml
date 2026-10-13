@@ -1,0 +1,60 @@
+# No-server deployment: copy this to .github/workflows/watch.yml in a PUBLIC repo
+# (public = unlimited free Actions minutes; private only gets 2,000 min/month,
+# which a long-running watcher would exhaust in a few days).
+#
+# Safe to make public: credentials live in encrypted repository secrets, the logs
+# print counts only - never job titles - and state.json holds nothing but job ids.
+#
+# Each run polls every 60s for just under 5 hours, then exits so the next run
+# takes over. Set the three secrets in Settings > Secrets and variables > Actions:
+#   LF_EMAIL, LF_PASSWORD, NTFY_TOPIC
+name: liveforce-watch
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"
+  workflow_dispatch:
+
+# Never run two watchers at once: a second one would not know what the first has
+# already notified about. A queued run starts as soon as the current one exits.
+concurrency:
+  group: liveforce-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache the Chromium download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # Carries the "already seen" list between runs. If this ever misses, the
+      # next run re-baselines silently rather than announcing the whole board.
+      - name: Restore seen-shift list
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: lf-state-${{ github.run_id }}
+          restore-keys: lf-state-
+
+      - name: Watch the job board
+        env:
+          LF_EMAIL: ${{ secrets.LF_EMAIL }}
+          LF_PASSWORD: ${{ secrets.LF_PASSWORD }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python watch.py --loop --interval 60 --max-runtime 17700
