@@ -305,6 +305,29 @@ def _when(start_iso: str, timezone: str) -> str:
         return moment.strftime("%a %d %b %H:%M UTC")
 
 
+def post_board(spec: dict, max_pages: int = 25) -> dict[str, str]:
+    """Every shift on one agency board, following the cursor to the last page.
+
+    The captured request asks for one page of 100. A board larger than that churns
+    roles in and out of page one, which looks like the total changing while nothing
+    is ever "new". The response's "c" field is the cursor for the next page, null on
+    the last one. Each page carries its own string table, so pages are decoded
+    separately and then merged.
+    """
+    body = json.loads(spec["body"])
+    shifts: dict[str, str] = {}
+    cursor = None
+    for page_number in range(1, max_pages + 1):
+        body["variables"]["cursor"] = cursor
+        page = post({**spec, "body": json.dumps(body)})
+        shifts.update(extract_shifts(page))
+        cursor = ((page.get("data") or {}).get("jobsAvailable") or {}).get("c")
+        if not cursor:
+            return shifts
+    log(f"warning: stopped paging {spec.get('agency')} after {max_pages} pages")
+    return shifts
+
+
 def extract_shifts(payload: dict) -> dict[str, str]:
     """Map role id -> human label, keeping only roles within RADIUS_KM of ORIGIN.
 
@@ -422,7 +445,7 @@ def check_once(state: dict, email: str, password: str, quiet_first_run: bool) ->
         out: dict[str, str] = {}
         for spec in state["requests"]:
             agency = spec.get("agency") or str(spec.get("company_id", ""))
-            for key, label in extract_shifts(post(spec)).items():
+            for key, label in post_board(spec).items():
                 out[f"{agency}/{key}"] = f"{agency}: {label}" if agency else label
         return out
 
