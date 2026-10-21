@@ -5,14 +5,14 @@
 # Safe to make public: credentials live in encrypted repository secrets, the logs
 # print counts only - never job titles - and state.json holds nothing but job ids.
 #
-# Each run polls every 60s for just under 5 hours, then exits so the next run
+# Each run polls every 60s for 3h50m, then exits so the next run
 # takes over. Set the three secrets in Settings > Secrets and variables > Actions:
 #   LF_EMAIL, LF_PASSWORD, NTFY_TOPIC
 name: liveforce-watch
 
 on:
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "0 0,4,8,12,16,20 * * *"
   workflow_dispatch:
     inputs:
       test_notification:
@@ -22,7 +22,7 @@ on:
 
 # Never run two watchers at once: a second one would not know what the first has
 # already notified about. The newest run wins - without this, a manual re-run would
-# sit queued behind the 5-hour run already in progress. The running job normally
+# sit queued behind the run already in progress. The running job normally
 # exits on its own (--max-runtime) before the next schedule fires, so cancelling
 # here is the exception, not the rule.
 # A test push gets its own group so it does not cancel the live watcher.
@@ -102,4 +102,4 @@ jobs:
           LF_EMAIL: ${{ secrets.LF_EMAIL }}
           LF_PASSWORD: ${{ secrets.LF_PASSWORD }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python watch.py --loop --interval 60 --max-runtime 17700
+        run: python watch.py --loop --interval 60 --max-runtime 13800
