@@ -86,11 +86,43 @@ for bad in ({}, {"data": {}}, {"data": {"jobsAvailable": {"j": []}}}):
         check(f"a broken payload raises, not returns empty ({bad})", True)
 
 
+# --- post_board: cursor paging ----------------------------------------------
+def page_with(role_id, cursor):
+    page = board(
+        [{"i": 500, "t": "$1", "l": "$2", "n": "$3", "x": SYD[0], "y": SYD[1]}],
+        [{"i": role_id, "j": 500, "n": "$4", "s": "2026-11-02T04:00:00Z"}],
+        STRINGS,
+    )
+    page["data"]["jobsAvailable"]["c"] = cursor
+    return page
+
+
+pages = [page_with(901, "cur1"), page_with(902, "cur2"), page_with(903, None)]
+asked = []
+
+
+def fake_post(spec):
+    asked.append(json.loads(spec["body"])["variables"]["cursor"])
+    return pages[len(asked) - 1]
+
+
+watch.post = fake_post
+spec = {"url": "u", "headers": {}, "body": json.dumps({"variables": {"cursor": None, "perPage": 100}})}
+got = watch.post_board(spec)
+check("every page is merged", set(got) == {"r:901", "r:902", "r:903"})
+check("the cursor is passed back in order", asked == [None, "cur1", "cur2"])
+
+asked.clear()
+pages = [page_with(900 + n, f"c{n}") for n in range(30)]  # never returns a null cursor
+got = watch.post_board(spec, max_pages=3)
+check("paging stops at max_pages", len(asked) == 3)
+
+
 # --- check_once: baseline, notify, no repeats -------------------------------
 fresh_state_file()
 pushes = []
 watch.notify = lambda title, body: pushes.append((title, body))
-AGENCY = {"url": "u", "headers": {}, "body": "b", "company_id": 151, "agency": "Mash Staffing Australia"}
+AGENCY = {"url": "u", "headers": {}, "body": json.dumps({"variables": {"cursor": None, "perPage": 100}}), "company_id": 151, "agency": "Mash Staffing Australia"}
 watch.capture_requests = lambda e, p: [dict(AGENCY)]
 watch.post = lambda spec: one
 
@@ -120,8 +152,8 @@ check("state survives a restart", json.loads(watch.STATE_FILE.read_text("utf8"))
 # --- two agencies ------------------------------------------------------------
 fresh_state_file()
 pushes.clear()
-a = {"url": "u", "headers": {}, "body": "b", "company_id": 151, "agency": "Mash"}
-bb = {"url": "u", "headers": {}, "body": "b", "company_id": 537, "agency": "Maverick"}
+a = {"url": "u", "headers": {}, "body": json.dumps({"variables": {"cursor": None, "perPage": 100}}), "company_id": 151, "agency": "Mash"}
+bb = {"url": "u", "headers": {}, "body": json.dumps({"variables": {"cursor": None, "perPage": 100}}), "company_id": 537, "agency": "Maverick"}
 # Same job id on both boards: the collision this keying exists to prevent.
 same_id = one  # identical role id 900 served by both agencies
 watch.post = lambda spec: same_id
