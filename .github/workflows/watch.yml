@@ -27,7 +27,7 @@ on:
 # here is the exception, not the rule.
 # A test push gets its own group so it does not cancel the live watcher.
 concurrency:
-    group: liveforce-watch-${{ github.event_name == 'workflow_dispatch' && inputs.test_notification && 'test' || 'watch' }}
+  group: liveforce-watch-${{ github.event_name == 'workflow_dispatch' && inputs.test_notification && 'test' || 'watch' }}
   cancel-in-progress: true
 
 jobs:
